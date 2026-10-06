@@ -2,15 +2,15 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { getInstallationSecrets } from "@db/services/installation-secrets";
-import { openInstinctContactUrl } from "@shared/chat/contact-card";
+import { boostleContactUrl } from "@shared/chat/contact-card";
 import { GET } from "../route";
 
 async function contactUrl() {
   const { betterAuthSecret } = await getInstallationSecrets();
-  return new URL(openInstinctContactUrl("+12025550123", betterAuthSecret));
+  return new URL(boostleContactUrl("+12025550123", betterAuthSecret));
 }
 
-describe("OpenInstinct contact download", () => {
+describe("Boostle contact download", () => {
   it("allows a signed provider download with the number and full logo", async () => {
     const response = await GET(new Request(await contactUrl()));
     expect(response.status).toBe(200);
@@ -18,7 +18,7 @@ describe("OpenInstinct contact download", () => {
       "text/vcard; charset=utf-8"
     );
     expect(response.headers.get("Content-Disposition")).toBe(
-      'attachment; filename="OpenInstinct.vcf"'
+      'attachment; filename="Boostle.vcf"'
     );
     expect(response.headers.get("Cache-Control")).toBe("private, no-store");
     const card = await response.text();
@@ -27,7 +27,7 @@ describe("OpenInstinct contact download", () => {
     ).toBe(true);
     const unfolded = card.replace(/\r\n /g, "");
     expect(unfolded).toContain(
-      "N:;OpenInstinct;;;\r\nFN:OpenInstinct\r\nTEL;TYPE=CELL:+12025550123\r\n"
+      "N:;Boostle;;;\r\nFN:Boostle\r\nTEL;TYPE=CELL:+12025550123\r\n"
     );
     const logo = await readFile(join(process.cwd(), "app/apple-icon.png"));
     expect(unfolded).toContain(
@@ -52,7 +52,7 @@ describe("OpenInstinct contact download", () => {
 
   it("rejects an unsigned download", async () => {
     const response = await GET(
-      new Request("https://example.com/contacts/openinstinct.vcf")
+      new Request("https://example.com/contacts/boostle.vcf")
     );
     expect(response.status).toBe(404);
   });

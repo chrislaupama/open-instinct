@@ -20,7 +20,7 @@ const controls = vi.hoisted(() => ({
 vi.mock("eve/context", () => ({
   defineState<T>(name: string, initial: () => T) {
     let value = initial();
-    if (name === "openinstinct.contact-delivery")
+    if (name === "boostle.contact-delivery")
       controls.readContactSent.mockImplementation(
         () => z.object({ sent: z.boolean() }).nullable().parse(value)?.sent
       );
@@ -85,7 +85,7 @@ describe("share_contact", () => {
         {
           kind: "file",
           mimeType: "text/vcard",
-          name: "OpenInstinct.vcf",
+          name: "Boostle.vcf",
         },
       ],
     });
@@ -93,7 +93,7 @@ describe("share_contact", () => {
     expect(
       contact.kind === "message" && contact.attachments?.[0]?.url
     ).toContain(
-      "https://example.com/contacts/openinstinct.vcf?phone=%2B12025550123&expires="
+      "https://example.com/contacts/boostle.vcf?phone=%2B12025550123&expires="
     );
     expect(controls.readPhone).not.toHaveBeenCalled();
     expect(controls.readContactSent()).toBe(true);
@@ -128,7 +128,7 @@ describe("share_contact", () => {
       throw new Error("Expected contact message.");
     expect(firstPayload).toEqual({
       message: {
-        idempotency_key: "openinstinct-contact:session-1",
+        idempotency_key: "boostle-contact:session-1",
         parts: [
           { type: "text", value: "Save my contact." },
           { type: "media", url: contact.attachments?.[0]?.url },
