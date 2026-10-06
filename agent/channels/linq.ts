@@ -6,6 +6,7 @@ import {
   type LinqChannelCredentials,
 } from "eve/channels/linq";
 import { vercelOidc } from "eve/channels/auth";
+import type { ChatSdkChannelState } from "eve/channels/chat-sdk";
 import { z } from "zod";
 import { resolveLinqReplyTarget } from "@agent/lib/reply-targets";
 import { scopeFromPrincipal } from "@agent/lib/principal-scope";
@@ -20,6 +21,7 @@ import {
   stripImageArtifactMarkdownReferences,
 } from "../lib/linq-image-artifact/markdown";
 import { env } from "@shared/environment";
+import { shareLinqContactCard } from "@agent/lib/linq/contact-card";
 import {
   linqCredentials,
   sendNativeLinqMessage,
@@ -37,6 +39,8 @@ const verifiedPhoneUserSchema = z.object({
 const unavailableReplyTargetSchema = z.object({
   status: z.union([z.literal(400), z.literal(404)]),
 });
+// Linq recommends sharing the contact card at most once a day per chat.
+const contactCardShareIntervalMs = 24 * 60 * 60 * 1000;
 
 type LinqMessageContent = Parameters<
   LinqAPIV3["chats"]["messages"]["send"]
@@ -144,170 +148,182 @@ export default linqChannel({
       }
 
       const message = sendMessageToolResultSchema.safeParse(event.result);
-      if (
-        event.status === "completed" &&
-        message.success &&
-        message.data.toolName === "send_message"
-      ) {
-        const { thread } = context;
-        if (!thread) {
-          throw new Error(
-            "send_message requires an active Linq conversation thread."
-          );
-        }
-        const report = scheduledReportFromSession(session);
-        const replyTarget = resolveLinqReplyTarget(
-          message.data.output.replyTo,
-          session.session.auth
+      if (event.status !== "completed" || !message.success) return;
+      const { thread } = context;
+      const report = scheduledReportFromSession(session);
+      const shareContactCard = async () => {
+        // Scheduled reports run in their own sessions; the conversation's
+        // session owns the chat's daily share.
+        if (!thread || report) return;
+        const { chatId, pendingHandle } = context.bot
+          .getAdapter("linq")
+          .decodeThreadId(thread.id);
+        if (chatId && !pendingHandle)
+          await shareContactCardDaily(context.state, chatId);
+      };
+      // share_contact delivers its vCard itself; add the native card here.
+      if (message.data.toolName === "share_contact") {
+        await shareContactCard();
+        return;
+      }
+      if (!thread) {
+        throw new Error(
+          "send_message requires an active Linq conversation thread."
         );
-        const requestedReplyMessageId =
-          replyTarget?.conversationId === thread.id
-            ? replyTarget.messageId
-            : undefined;
-        const idempotencyKey = report
-          ? `scheduled-report:${report.runId}:${String(report.sequence)}`
+      }
+      const completeDelivery = async () => {
+        await finalizeScheduledReportDelivery(session);
+        await shareContactCard();
+      };
+      const replyTarget = resolveLinqReplyTarget(
+        message.data.output.replyTo,
+        session.session.auth
+      );
+      const requestedReplyMessageId =
+        replyTarget?.conversationId === thread.id
+          ? replyTarget.messageId
           : undefined;
-        const adapter = context.bot.getAdapter("linq");
-        const post = idempotencyKey
-          ? (content: AdapterPostableMessage) =>
-              adapter.postMessage(thread.id, content, { idempotencyKey })
-          : (content: AdapterPostableMessage) => thread.post(content);
-        const postReply = (
-          content: AdapterPostableMessage,
-          replyToMessageId: string
-        ) => {
-          if (idempotencyKey) {
-            return adapter.postMessage(thread.id, content, {
-              idempotencyKey,
-              replyToMessageId,
-            });
-          }
+      const idempotencyKey = report
+        ? `scheduled-report:${report.runId}:${String(report.sequence)}`
+        : undefined;
+      const adapter = context.bot.getAdapter("linq");
+      const post = idempotencyKey
+        ? (content: AdapterPostableMessage) =>
+            adapter.postMessage(thread.id, content, { idempotencyKey })
+        : (content: AdapterPostableMessage) => thread.post(content);
+      const postReply = (
+        content: AdapterPostableMessage,
+        replyToMessageId: string
+      ) => {
+        if (idempotencyKey) {
           return adapter.postMessage(thread.id, content, {
+            idempotencyKey,
             replyToMessageId,
           });
-        };
-        const resolveExistingChatId = () => {
-          const { chatId, pendingHandle } = adapter.decodeThreadId(thread.id);
-          if (pendingHandle || !chatId) {
-            throw new Error("A Linq reply requires an existing conversation.");
-          }
-          return chatId;
-        };
+        }
+        return adapter.postMessage(thread.id, content, {
+          replyToMessageId,
+        });
+      };
+      const resolveExistingChatId = () => {
+        const { chatId, pendingHandle } = adapter.decodeThreadId(thread.id);
+        if (pendingHandle || !chatId) {
+          throw new Error("A Linq reply requires an existing conversation.");
+        }
+        return chatId;
+      };
 
-        if (message.data.output.kind === "link") {
-          const { url } = message.data.output;
-          const chatId = resolveExistingChatId();
-          const sendLink = (replyToMessageId?: string) => {
-            const nativeMessage: LinqMessageContent = {
-              parts: [{ type: "link", value: url }],
-            };
-            if (idempotencyKey) {
-              nativeMessage.idempotency_key = idempotencyKey;
-            }
-            if (replyToMessageId) {
-              nativeMessage.reply_to = { message_id: replyToMessageId };
-            }
-            return sendNativeLinqMessage(chatId, nativeMessage);
+      if (message.data.output.kind === "link") {
+        const { url } = message.data.output;
+        const chatId = resolveExistingChatId();
+        const sendLink = (replyToMessageId?: string) => {
+          const nativeMessage: LinqMessageContent = {
+            parts: [{ type: "link", value: url }],
           };
-          try {
-            await sendLink(requestedReplyMessageId);
-          } catch (error) {
-            if (
-              !requestedReplyMessageId ||
-              !unavailableReplyTargetSchema.safeParse(error).success
-            ) {
-              throw error;
-            }
-            console.warn("[linq] reply target is unavailable", {
-              sessionId: session.session.id,
-            });
-            await sendLink();
+          if (idempotencyKey) {
+            nativeMessage.idempotency_key = idempotencyKey;
           }
-          await finalizeScheduledReportDelivery(session);
-          return;
-        }
-
-        const attachments = message.data.output.attachments?.map(
-          ({ kind, ...attachment }) => ({ ...attachment, type: kind })
-        );
-        const { text: requestedText } = message.data.output;
-        if (!requestedText) {
-          if (attachments?.length) {
-            await sendLinqMessage({
-              outgoing: { attachments, raw: "" },
-              post,
-              postReply,
-              replyToMessageId: requestedReplyMessageId,
-            });
-            await finalizeScheduledReportDelivery(session);
-            return;
+          if (replyToMessageId) {
+            nativeMessage.reply_to = { message_id: replyToMessageId };
           }
-          await finalizeScheduledReportDelivery(session);
-          return;
+          return sendNativeLinqMessage(chatId, nativeMessage);
+        };
+        try {
+          await sendLink(requestedReplyMessageId);
+        } catch (error) {
+          if (
+            !requestedReplyMessageId ||
+            !unavailableReplyTargetSchema.safeParse(error).success
+          ) {
+            throw error;
+          }
+          console.warn("[linq] reply target is unavailable", {
+            sessionId: session.session.id,
+          });
+          await sendLink();
         }
+        await completeDelivery();
+        return;
+      }
 
-        const caller =
-          session.session.auth.current ?? session.session.auth.initiator;
-        if (!caller) {
-          const references =
-            extractImageArtifactMarkdownReferences(requestedText);
-          const text =
-            references.length === 0
-              ? requestedText
-              : [
-                  stripImageArtifactMarkdownReferences(requestedText),
-                  "I couldn't attach the image.",
-                ]
-                  .filter(Boolean)
-                  .join("\n\n");
-          const outgoing: Extract<
-            Parameters<typeof thread.post>[0],
-            { raw: string }
-          > = { raw: text };
-          if (attachments?.length) outgoing.attachments = attachments;
+      const attachments = message.data.output.attachments?.map(
+        ({ kind, ...attachment }) => ({ ...attachment, type: kind })
+      );
+      const { text: requestedText } = message.data.output;
+      if (!requestedText) {
+        if (attachments?.length) {
           await sendLinqMessage({
-            outgoing,
+            outgoing: { attachments, raw: "" },
             post,
             postReply,
             replyToMessageId: requestedReplyMessageId,
           });
-          await finalizeScheduledReportDelivery(session);
+          await completeDelivery();
           return;
         }
+        await finalizeScheduledReportDelivery(session);
+        return;
+      }
 
-        const delivery = await prepareLinqImageArtifactDelivery(requestedText, {
-          rootSessionId: report?.workerSessionId ?? session.session.id,
-          scope: scopeFromPrincipal(caller),
-        });
-        if (delivery.failedArtifactIds.length > 0) {
-          console.warn("[linq] browser image delivery failed", {
-            artifactIds: delivery.failedArtifactIds,
-            sessionId: session.session.id,
-          });
-        }
-        const failureMessage =
-          delivery.failedArtifactIds.length === 0
-            ? ""
-            : delivery.failedArtifactIds.length === 1
-              ? "I couldn't attach one image."
-              : `I couldn't attach ${String(delivery.failedArtifactIds.length)} images.`;
-        const text = [delivery.text, failureMessage]
-          .filter(Boolean)
-          .join("\n\n");
+      const caller =
+        session.session.auth.current ?? session.session.auth.initiator;
+      if (!caller) {
+        const references =
+          extractImageArtifactMarkdownReferences(requestedText);
+        const text =
+          references.length === 0
+            ? requestedText
+            : [
+                stripImageArtifactMarkdownReferences(requestedText),
+                "I couldn't attach the image.",
+              ]
+                .filter(Boolean)
+                .join("\n\n");
         const outgoing: Extract<
           Parameters<typeof thread.post>[0],
           { raw: string }
         > = { raw: text };
         if (attachments?.length) outgoing.attachments = attachments;
-        if (delivery.files.length > 0) outgoing.files = delivery.files;
         await sendLinqMessage({
           outgoing,
           post,
           postReply,
           replyToMessageId: requestedReplyMessageId,
         });
-        await finalizeScheduledReportDelivery(session);
+        await completeDelivery();
+        return;
       }
+
+      const delivery = await prepareLinqImageArtifactDelivery(requestedText, {
+        rootSessionId: report?.workerSessionId ?? session.session.id,
+        scope: scopeFromPrincipal(caller),
+      });
+      if (delivery.failedArtifactIds.length > 0) {
+        console.warn("[linq] browser image delivery failed", {
+          artifactIds: delivery.failedArtifactIds,
+          sessionId: session.session.id,
+        });
+      }
+      const failureMessage =
+        delivery.failedArtifactIds.length === 0
+          ? ""
+          : delivery.failedArtifactIds.length === 1
+            ? "I couldn't attach one image."
+            : `I couldn't attach ${String(delivery.failedArtifactIds.length)} images.`;
+      const text = [delivery.text, failureMessage].filter(Boolean).join("\n\n");
+      const outgoing: Extract<
+        Parameters<typeof thread.post>[0],
+        { raw: string }
+      > = { raw: text };
+      if (attachments?.length) outgoing.attachments = attachments;
+      if (delivery.files.length > 0) outgoing.files = delivery.files;
+      await sendLinqMessage({
+        outgoing,
+        post,
+        postReply,
+        replyToMessageId: requestedReplyMessageId,
+      });
+      await completeDelivery();
     },
     async "message.completed"(event, _context, session) {
       if (event.finishReason === "tool-calls") return;
@@ -401,6 +417,26 @@ async function sendLinqMessage({
       replyToMessageId,
     });
     await post(outgoing);
+  }
+}
+
+async function shareContactCardDaily(
+  state: ChatSdkChannelState,
+  chatId: string
+) {
+  const sharedAt = z.number().safeParse(state.contactCardSharedAt);
+  if (
+    sharedAt.success &&
+    Date.now() - sharedAt.data < contactCardShareIntervalMs
+  )
+    return;
+  // Record the attempt first so a failing setup retries daily, not per message.
+  state.contactCardSharedAt = Date.now();
+  try {
+    await shareLinqContactCard(chatId);
+  } catch (error) {
+    // The card is a courtesy; never fail the message that was just delivered.
+    console.warn("[linq] contact card share failed", { chatId, error });
   }
 }
 
