@@ -21,8 +21,8 @@ describe("iMessage event projection", () => {
           {
             kind: "file",
             mimeType: "text/vcard",
-            name: "OpenInstinct.vcf",
-            url: "https://example.com/contacts/openinstinct.vcf?signed=true",
+            name: "Boostle.vcf",
+            url: "https://example.com/contacts/boostle.vcf?signed=true",
           },
         ],
       }),
@@ -33,9 +33,9 @@ describe("iMessage event projection", () => {
           expect.objectContaining({ type: "text", text: "Save my contact." }),
           expect.objectContaining({
             type: "file",
-            filename: "OpenInstinct.vcf",
+            filename: "Boostle.vcf",
             mediaType: "text/vcard",
-            url: "https://example.com/contacts/openinstinct.vcf?signed=true",
+            url: "https://example.com/contacts/boostle.vcf?signed=true",
           }),
         ],
       }),
