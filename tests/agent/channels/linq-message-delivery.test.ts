@@ -5,6 +5,7 @@ import {
 } from "@linqapp/chat-sdk-adapter";
 import type { LinqAPIV3 } from "@linqapp/sdk";
 import type { AdapterPostableMessage } from "chat";
+import type { ChatSdkChannelState } from "eve/channels/chat-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as Blob from "@vercel/blob";
 import type * as EnvModule from "@shared/environment";
@@ -68,6 +69,31 @@ const linqChannelCapture = vi.hoisted(() => ({
     >()
     .mockResolvedValue({ message: { id: "native-message-1" } }),
 }));
+interface TestContactCard {
+  first_name: string;
+  image_url?: string;
+  is_active: boolean;
+  phone_number: string;
+}
+const contactCardCapture = vi.hoisted(() => ({
+  createCard:
+    vi.fn<
+      (params: Omit<TestContactCard, "is_active">) => Promise<TestContactCard>
+    >(),
+  retrieveCards:
+    vi.fn<
+      (query: {
+        phone_number: string;
+      }) => Promise<{ contact_cards: TestContactCard[] }>
+    >(),
+  retrieveChat: vi.fn<
+    (chatId: string) => Promise<{
+      handles: { handle: string; is_me?: boolean }[];
+      service: "iMessage" | "RCS" | "SMS" | null;
+    }>
+  >(),
+  share: vi.fn<(chatId: string) => Promise<void>>(),
+}));
 const scheduleDeliveryCapture = vi.hoisted(() => ({
   finalize: vi.fn<typeof finalizeScheduledReport>(),
   release: vi.fn<typeof releaseScheduledReport>(),
@@ -96,6 +122,13 @@ vi.mock("@linqapp/sdk", () => ({
 
     chats = {
       messages: { send: linqChannelCapture.sendNativeMessage },
+      retrieve: contactCardCapture.retrieveChat,
+      shareContactCard: contactCardCapture.share,
+    };
+
+    contactCard = {
+      create: contactCardCapture.createCard,
+      retrieve: contactCardCapture.retrieveCards,
     };
   },
 }));
@@ -1066,6 +1099,156 @@ describe("Linq message delivery", () => {
   });
 });
 
+describe("Linq contact card sharing", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    scheduleDeliveryCapture.finalize.mockResolvedValue(true);
+    contactCardCapture.retrieveChat.mockResolvedValue(
+      contactCardChat("+12025550100")
+    );
+    contactCardCapture.retrieveCards.mockResolvedValue({ contact_cards: [] });
+    contactCardCapture.createCard.mockImplementation(async (params) => ({
+      ...params,
+      is_active: true,
+    }));
+    contactCardCapture.share.mockResolvedValue(undefined);
+  });
+
+  it("creates the line's card and shares it once a day after a reply", async () => {
+    contactCardCapture.retrieveChat.mockResolvedValue(
+      contactCardChat("+12025550199")
+    );
+    const state: ChatSdkChannelState = { thread: null };
+    const { context, post } = handlerContext("message-1", state);
+    const reply = sendMessageResult({ kind: "message", text: "Hi there." });
+
+    await handleActionResult(reply, context, sessionContext());
+    await handleActionResult(reply, context, sessionContext());
+
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(contactCardCapture.createCard).toHaveBeenCalledExactlyOnceWith({
+      first_name: "Boostle",
+      image_url: "https://example.com/apple-icon.png",
+      phone_number: "+12025550199",
+    });
+    expect(contactCardCapture.share).toHaveBeenCalledExactlyOnceWith("chat-1");
+
+    state.contactCardSharedAt = Date.now() - 25 * 60 * 60 * 1000;
+    await handleActionResult(reply, context, sessionContext());
+
+    expect(contactCardCapture.share).toHaveBeenCalledTimes(2);
+    expect(contactCardCapture.retrieveCards).toHaveBeenCalledOnce();
+    expect(contactCardCapture.createCard).toHaveBeenCalledOnce();
+  });
+
+  it("shares an existing active card without recreating it", async () => {
+    contactCardCapture.retrieveChat.mockResolvedValue(
+      contactCardChat("+12025550101")
+    );
+    contactCardCapture.retrieveCards.mockResolvedValue({
+      contact_cards: [
+        {
+          first_name: "Boostle",
+          is_active: true,
+          phone_number: "+12025550101",
+        },
+      ],
+    });
+    const { context } = handlerContext("message-1", { thread: null });
+
+    await handleActionResult(
+      sendMessageResult({ kind: "message", text: "Hi there." }),
+      context,
+      sessionContext()
+    );
+
+    expect(contactCardCapture.createCard).not.toHaveBeenCalled();
+    expect(contactCardCapture.share).toHaveBeenCalledExactlyOnceWith("chat-1");
+  });
+
+  it("does not share outside iMessage", async () => {
+    contactCardCapture.retrieveChat.mockResolvedValue({
+      ...contactCardChat("+12025550100"),
+      service: "SMS",
+    });
+    const { context } = handlerContext("message-1", { thread: null });
+
+    await handleActionResult(
+      sendMessageResult({ kind: "message", text: "Hi there." }),
+      context,
+      sessionContext()
+    );
+
+    expect(contactCardCapture.createCard).not.toHaveBeenCalled();
+    expect(contactCardCapture.share).not.toHaveBeenCalled();
+  });
+
+  it("keeps the delivered message when sharing fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    contactCardCapture.share.mockRejectedValue(new Error("Linq unavailable"));
+    const { context, post } = handlerContext("message-1", { thread: null });
+
+    await expect(
+      handleActionResult(
+        sendMessageResult({ kind: "message", text: "Hi there." }),
+        context,
+        sessionContext()
+      )
+    ).resolves.toBeUndefined();
+
+    expect(post).toHaveBeenCalledExactlyOnceWith({ raw: "Hi there." });
+    expect(warn).toHaveBeenCalledWith(
+      "[linq] contact card share failed",
+      expect.objectContaining({ chatId: "chat-1" })
+    );
+    warn.mockRestore();
+  });
+
+  it("leaves the daily share to the conversation session for scheduled reports", async () => {
+    const { context } = handlerContext("message-1", { thread: null });
+
+    await handleActionResult(
+      sendMessageResult({ kind: "message", text: "Your report." }),
+      context,
+      sessionContext("scheduled-result")
+    );
+
+    expect(contactCardCapture.retrieveChat).not.toHaveBeenCalled();
+  });
+
+  it("adds the native card when share_contact delivers its vCard", async () => {
+    const event = sendMessageResult({
+      kind: "message",
+      text: "Save my contact.",
+      attachments: [
+        {
+          kind: "file",
+          url: "https://example.com/contacts/boostle.vcf?signed=true",
+        },
+      ],
+    });
+    if (event.result.kind !== "tool-result")
+      throw new Error("Expected tool result.");
+    event.result.toolName = "share_contact";
+    const { context, post } = handlerContext("message-1", { thread: null });
+
+    await handleActionResult(event, context, sessionContext());
+
+    expect(post).not.toHaveBeenCalled();
+    expect(contactCardCapture.share).toHaveBeenCalledExactlyOnceWith("chat-1");
+  });
+});
+
+function contactCardChat(phoneNumber: string) {
+  return {
+    handles: [
+      { handle: phoneNumber, is_me: true },
+      { handle: "+12025550123", is_me: false },
+    ],
+    service: "iMessage" as const,
+  };
+}
+
 function sendMessageResult(
   output: ActionHandlerParameters[0]["result"] extends { output: infer Output }
     ? Output
@@ -1104,7 +1287,14 @@ function reactToMessageResult(
   };
 }
 
-function handlerContext(currentMessageId: string | null = "message-1") {
+function handlerContext(
+  currentMessageId: string | null = "message-1",
+  // Most cases are about message delivery, so the daily card share is done.
+  state: ChatSdkChannelState = {
+    contactCardSharedAt: Date.now(),
+    thread: null,
+  }
+) {
   const post = vi.fn<(message: LinqTestMessage) => Promise<{ id: string }>>();
   post.mockResolvedValue(rawMessage("message-2"));
   const addReaction = vi
@@ -1122,7 +1312,7 @@ function handlerContext(currentMessageId: string | null = "message-1") {
         removeReaction,
       }),
     },
-    state: {},
+    state,
     streaming: false,
     streamingEditIntervalMs: 1000,
     thread: {
