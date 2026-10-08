@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { headers } from "next/headers";
+import { Analytics } from "@vercel/analytics/next";
 import { QueryProvider } from "@app/_providers/query-provider";
 import { TooltipProvider } from "@web/components/ui/tooltip";
 import { accessScopeForUser } from "@shared/identity/access-scope";
@@ -26,6 +27,7 @@ export default async function RootLayout({ children }: LayoutProps<"/">) {
         <QueryProvider>
           <TooltipProvider>{children}</TooltipProvider>
         </QueryProvider>
+        <Analytics />
       </body>
     </html>
   );
